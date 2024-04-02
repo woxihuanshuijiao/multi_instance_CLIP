@@ -1,0 +1,20 @@
+CUDA_VISIBLE_DEVICES=1 /home/yanshuang/anaconda3/envs/localization/bin/python  /home/wangyuhan/clip/open_clip/src/training/main.py \
+    --div_h 2 \
+    --div_w 2 \
+    --min_subfigs 1 \
+    --max_subfigs 6 \
+    --subfig_size 224 \
+    --zoom_flag False \
+    --save-frequency 1 \
+    --zeroshot-frequency 1 \
+    --train-data "/home/wangyuhan/clip/open_clip/test_imgs.csv"  \
+    --csv-img-key img \
+    --csv-caption-key caption \
+    --warmup 5000 \
+    --batch-size=16 \
+    --pretrained=openai \
+    --lr=1e-4 \
+    --wd=0.1 \
+    --epochs=30 \
+    --workers=8 \
+    --model ViT-B-16
