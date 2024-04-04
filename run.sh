@@ -4,7 +4,7 @@ CUDA_VISIBLE_DEVICES=1 /home/yanshuang/anaconda3/envs/localization/bin/python  /
     --min_subfigs 1 \
     --max_subfigs 6 \
     --subfig_size 224 \
-    --zoom_flag False \
+    --zoom_flag True \
     --save-frequency 1 \
     --zeroshot-frequency 1 \
     --train-data "/home/wangyuhan/clip/open_clip/test_imgs.csv"  \

@@ -46,10 +46,11 @@ def crop_and_merge(images, subfig_size):
     return images
 
 
-# 缩放函数
+# FIXME 缩放函数
 def zoom_(img, h, w, subsize):
     weight, height = img.size
-    if weight > w*subsize or height > h*subsize:
+    ratio = (h * w * (subsize**2)) / (weight * height)
+    if ratio < 0.7:
         pane_size = (w*subsize, h*subsize)  
         img.thumbnail(pane_size, Image.ANTIALIAS) 
       
@@ -130,6 +131,7 @@ class CsvDataset(Dataset):
         transforms_list = list(self.transforms.transforms)
         # transforms_list[0] = tf.CenterCrop((448, 448))
         transforms_list[0] =  AutoCrop(max_subfigs=max_subfigs, min_subfigs=min_subfigs, subfig_size=subfig_size, zoom_flag=zoom_flag)
+        # transforms_list.insert(1, tf.RandomRotation(degrees=[0, 180]) )
         self.transforms = tf.Compose(transforms_list)
 
         logging.debug('Done loading data.')
