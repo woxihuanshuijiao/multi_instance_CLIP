@@ -19,7 +19,7 @@ from .hf_model import HFTextEncoder
 from .modified_resnet import ModifiedResNet
 from .timm_model import TimmModel
 from .transformer import LayerNormFp32, LayerNorm, QuickGELU, Attention, VisionTransformer, TextTransformer,\
-    text_global_pool, AttentionLayer, Transformer
+    text_global_pool, AttentionLayer, Transformer, MyTransformer
 from .utils import to_2tuple
 
 
@@ -89,9 +89,11 @@ class CLIPTextCfg:
 
 # FIXME 修改处
 @dataclass
-class ATTCfg:
-    dim: int = 512
-    num_heads: int = 8
+class MyTransformerCfg:
+    width: int = 512
+    num_heads: int = 6
+    layers: int = 3
+    subfig_num: int = 6
 
 
 def get_cast_dtype(precision: str):
@@ -113,9 +115,9 @@ def get_input_dtype(precision: str):
 
 
 # FIXME attention层，模仿
-def _build_attention_layer(attcfg: ATTCfg, vision_cfg : CLIPVisionCfg, quick_gelu :bool = False, 
+def _build_attention_layer(embed_dim: int, mytransformer_cfg: MyTransformerCfg, vision_cfg : CLIPVisionCfg, quick_gelu :bool = False, 
                            cast_dtype: Optional[torch.dtype] = None,):
-    vision_heads = vision_cfg.width * 32 // vision_cfg.head_width
+    transformer_heads = mytransformer_cfg.width // vision_cfg.head_width
     
     act_layer = QuickGELU if quick_gelu else nn.GELU
 
@@ -126,13 +128,26 @@ def _build_attention_layer(attcfg: ATTCfg, vision_cfg : CLIPVisionCfg, quick_gel
         act_layer = partial(act_layer, **vision_cfg.act_kwargs)
 
 
-    attenton_layer = Transformer(width=512,
-            layers=vision_cfg.layers,
-            heads=attcfg.num_heads,
+    attenton_layer = MyTransformer(image_size=vision_cfg.image_size,
+            patch_size=vision_cfg.patch_size,
+            width=mytransformer_cfg.width,
+            layers=mytransformer_cfg.layers,
+            heads=transformer_heads,
+            subfig_num=mytransformer_cfg.subfig_num,
             mlp_ratio=vision_cfg.mlp_ratio,
             ls_init_value=vision_cfg.ls_init_value,
+            patch_dropout=vision_cfg.patch_dropout,
+            attentional_pool=vision_cfg.attentional_pool,
+            attn_pooler_queries=vision_cfg.attn_pooler_queries,
+            attn_pooler_heads=vision_cfg.attn_pooler_heads,
+            pos_embed_type=vision_cfg.pos_embed_type,
+            no_ln_pre=vision_cfg.no_ln_pre,
+            final_ln_after_pool=vision_cfg.final_ln_after_pool,
+            pool_type=vision_cfg.pool_type,
+            output_dim=embed_dim,
             act_layer=act_layer,
             norm_layer=norm_layer,)
+
     
     return attenton_layer
 
@@ -261,7 +276,7 @@ class CLIP(nn.Module):
             embed_dim: int,
             vision_cfg: CLIPVisionCfg,
             text_cfg: CLIPTextCfg,
-            att_config: ATTCfg, #FIXME 已修改
+            mytransformer_cfg: MyTransformerCfg, #FIXME 已修改
 
             quick_gelu: bool = False,
             init_logit_scale: float = np.log(1 / 0.07),
@@ -273,9 +288,8 @@ class CLIP(nn.Module):
         super().__init__()
         self.output_dict = output_dict
 
-        self.att_config = att_config
         # FIXME 此处生硬指定，可以改
-        self.attention_layer = _build_attention_layer(att_config, vision_cfg, quick_gelu, cast_dtype)
+        self.attention_layer = _build_attention_layer(embed_dim, mytransformer_cfg, vision_cfg, quick_gelu, cast_dtype)
 
         self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu, cast_dtype)
 
@@ -307,8 +321,8 @@ class CLIP(nn.Module):
         self.transformer.grad_checkpointing = enable
     
     # FIXME 此处修改
-    def attention_comp(self, features, attn_mask, custom_flag):
-        attention_features = self.attention_layer(features, attn_mask, custom_flag)
+    def attention_comp(self, features, attn_mask):
+        attention_features = self.attention_layer(features, attn_mask)
         return attention_features
 
     # FIXME 全部改成attention
@@ -369,11 +383,19 @@ class CLIP(nn.Module):
         # 根据之前的记录进行mask填充
         for batch, subfigs in indices:
             torch.fill_(attn_mask[batch, :, subfigs], -float('inf')) 
+
+        # 为了匹配CLS信息，CLS信息不mask，添加一列全1
+        attn_mask = torch.cat((torch.ones((bs//max_subfigs, 1, 1), dtype=image_features.dtype), attn_mask)
+                  , dim=2)
         
         # # mask填充好后，扩展至输出维度
         broadcast_ones = torch.ones((bs//max_subfigs, max_subfigs, 1), dtype=image_features.dtype)
+        # 同样，在广播前，保证维度统一，需要将广播的矩阵也扩展一维，在最前添加一行
+        broadcast_ones = torch.cat((torch.ones((bs//max_subfigs, 1, 1), dtype=image_features.dtype), broadcast_ones)
+                  , dim=1)
+        
+        # 广播 在我们的例子（6张子图）下，mask的形状为（bs，7 ，7）
         attn_mask = broadcast_ones * attn_mask
-
         attn_mask = attn_mask.to(device=torch.device(device), dtype=image_features.dtype, non_blocking=True)
         
 
@@ -382,8 +404,8 @@ class CLIP(nn.Module):
 
         
         # 计算attention值 在bags的维度上，计算每张子图的attention
-        image_features = image_features.permute(1, 0, 2)
-        image_features = self.attention_comp(image_features, attn_mask, custom_flag=True)
+        # image_features = image_features.permute(1, 0, 2)
+        image_features = self.attention_comp(image_features, attn_mask)
 
         text_features = self.encode_text(text, normalize=True) if text is not None else None
 
@@ -580,19 +602,15 @@ def build_model_from_openai_state_dict(
     )
 
     # FIXME 修改
-    att_dim = state_dict["ln_final.weight"].shape[0]
-    # FIXME visual 修改
-    # state_dict = {k: v for k, v in state_dict.items() if 'visual.transformer' not in k} 
-    # state_dict = {k: v for k, v in state_dict.items() if 'transformer.' not in k} 
+    mytransformer_cfg=MyTransformerCfg()
 
-    att_config=ATTCfg(dim=att_dim)
     model = CLIP(
         embed_dim,
         vision_cfg=vision_cfg,
         text_cfg=text_cfg,
         quick_gelu=quick_gelu,  # OpenAI models were trained with QuickGELU
         cast_dtype=cast_dtype,
-        att_config=att_config,
+        mytransformer_cfg=mytransformer_cfg,
     )
 
     for key in ["input_resolution", "context_length", "vocab_size"]:

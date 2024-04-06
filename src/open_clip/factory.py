@@ -377,7 +377,6 @@ def create_model_and_transforms(
         cache_dir: Optional[str] = None,
         output_dict: Optional[bool] = None,
         # FIXME attention_mask
-        attn_mask: Optional[bool] = None,
         **model_kwargs,
 ):
     force_preprocess_cfg = merge_preprocess_kwargs(

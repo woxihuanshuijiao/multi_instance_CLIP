@@ -26,19 +26,6 @@ class ParseKwargs(argparse.Action):
 def parse_args(args):
     parser = argparse.ArgumentParser()
     # FIXME 添加的参数
-    parser.add_argument(
-        "--div_h",
-        type=int,
-        default=1,
-        help="沿y轴切割的子图数量",
-    )
-
-    parser.add_argument(
-        "--div_w",
-        type=int,
-        default=1,
-        help="沿x轴切割的子图数量",
-    )
 
     # FIXME 自动裁剪参数
 
@@ -68,6 +55,13 @@ def parse_args(args):
         type=bool,
         default=False,
         help="是否进行缩放",
+    )
+
+    parser.add_argument(
+        "--p",
+        type=float,
+        default=0.5,
+        help="进行翻转的概率",
     )
 
     

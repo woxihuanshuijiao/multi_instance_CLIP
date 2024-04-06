@@ -1,10 +1,9 @@
 CUDA_VISIBLE_DEVICES=1 /home/yanshuang/anaconda3/envs/localization/bin/python  /home/wangyuhan/clip/open_clip/src/training/main.py \
-    --div_h 2 \
-    --div_w 2 \
     --min_subfigs 1 \
     --max_subfigs 6 \
     --subfig_size 224 \
     --zoom_flag True \
+    --p 0.5 \
     --save-frequency 1 \
     --zeroshot-frequency 1 \
     --train-data "/home/wangyuhan/clip/open_clip/test_imgs.csv"  \

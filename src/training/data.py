@@ -53,6 +53,20 @@ def zoom_(img, h, w, subsize):
     if ratio < 0.7:
         pane_size = (w*subsize, h*subsize)  
         img.thumbnail(pane_size, Image.ANTIALIAS) 
+
+
+# FIXME 随机翻转函数
+def random_flip(img, p=0.5):
+    # 产生一个随机数（0-1之间的浮点数），如果随机数大于设定数，则保持为原图
+    # 如果随机数小于设定数的1/2，即水平翻转，否则垂直翻转
+    random_p = random.random()
+    if random_p > p:
+        return img
+    elif random_p <= p/2:
+        img = img.transpose(Image.FLIP_LEFT_RIGHT) 
+    else:
+        img = img.transpose(Image.FLIP_TOP_BOTTOM) 
+    return img
       
 
 
@@ -100,15 +114,19 @@ def _setup_size(img, max_subfigs, min_subfigs=1, subfig_size=224):
 
 # FIXME 自动裁剪类
 class AutoCrop(torch.nn.Module):
-    def __init__(self, max_subfigs, min_subfigs=1, subfig_size=224, zoom_flag=False):
+    def __init__(self, max_subfigs, min_subfigs=1, subfig_size=224, zoom_flag=False, p=0.5):
         super().__init__()
         self.max_subfigs = max_subfigs
         self.min_subfigs = min_subfigs
         self.subfig_size = subfig_size
         self.size = ()
         self.zoom_flag = zoom_flag
+        self.p = p
 
     def forward(self, img):
+        # FIXME 随机旋转功能加到自动裁剪类里面了
+        img = random_flip(img, self.p)
+
         self.size, h_crop_num, w_crop_num= _setup_size(img=img, max_subfigs=self.max_subfigs, subfig_size=self.subfig_size)
         if self.zoom_flag:
             zoom_(img=img, h=h_crop_num, w=w_crop_num, subsize=self.subfig_size)
@@ -117,7 +135,7 @@ class AutoCrop(torch.nn.Module):
 
 
 class CsvDataset(Dataset):
-    def __init__(self, input_filename, transforms, zoom_flag, subfig_size, max_subfigs, min_subfigs, img_key, caption_key, sep="\t", tokenizer=None):
+    def __init__(self, input_filename, transforms, p, zoom_flag, subfig_size, max_subfigs, min_subfigs, img_key, caption_key, sep="\t", tokenizer=None):
         logging.debug(f'Loading csv data from {input_filename}.')
         df = pd.read_csv(input_filename, sep=sep)
 
@@ -130,8 +148,7 @@ class CsvDataset(Dataset):
         # FIXME 已修改
         transforms_list = list(self.transforms.transforms)
         # transforms_list[0] = tf.CenterCrop((448, 448))
-        transforms_list[0] =  AutoCrop(max_subfigs=max_subfigs, min_subfigs=min_subfigs, subfig_size=subfig_size, zoom_flag=zoom_flag)
-        # transforms_list.insert(1, tf.RandomRotation(degrees=[0, 180]) )
+        transforms_list[0] =  AutoCrop(max_subfigs=max_subfigs, min_subfigs=min_subfigs, subfig_size=subfig_size, zoom_flag=zoom_flag, p=p)
         self.transforms = tf.Compose(transforms_list)
 
         logging.debug('Done loading data.')
@@ -596,6 +613,7 @@ def get_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
         input_filename,
         preprocess_fn,
         # FIXME 新增参数
+        p = args.p,
         zoom_flag=args.zoom_flag,
         subfig_size=args.subfig_size,
         max_subfigs=args.max_subfigs,
