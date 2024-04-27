@@ -64,6 +64,20 @@ def parse_args(args):
         help="进行翻转的概率",
     )
 
+    parser.add_argument(
+        "--freeze_text",
+        type=int,
+        default=0,
+        help="冻结text encoder参数",
+    )
+
+    parser.add_argument(
+        "--freeze_image",
+        type=int,
+        default=0,
+        help="冻结image encoder参数",
+    )
+
     
 
 

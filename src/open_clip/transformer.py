@@ -12,33 +12,6 @@ from .utils import to_2tuple
 from .pos_embed import get_2d_sincos_pos_embed
 
 
-# FIXME attention layer类
-class AttentionLayer(nn.Module):
-    def __init__(self, dimension):
-        super(AttentionLayer, self).__init__()
-        self.k_layer = nn.Linear(dimension, 1)
-        self.softmax = nn.Softmax(dim=1)
-        self.init_parameters()
-
-    def init_parameters(self):
-        pass
-
-    @torch.jit.ignore
-    def set_grad_checkpointing(self, enable=True):
-        pass
-    
-    def forward(self, x):
-        # (bs, sub_figs, sqlen) = input_seq.shape
-        # sqlen 输入
-        x = x.permute(1, 0, 2)
-        similarity = self.k_layer(x)
-        # FIXME mask填充
-        # similarity = similarity.masked_fill(mask == 0, float("-1e20"))  
-        weight = self.softmax(similarity) 
-        x = torch.bmm(x.transpose(1,2), weight).squeeze(2)
-        return x
-
-
 class LayerNormFp32(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16 (by casting to float32 and back)."""
 
@@ -117,7 +90,6 @@ class Attention(nn.Module):
     def __init__(
             self,
             dim,
-            # FIXME 头数
             num_heads=8,
             qkv_bias=True,
             scaled_cosine=False,
@@ -137,7 +109,6 @@ class Attention(nn.Module):
 
         # keeping in_proj in this form (instead of nn.Linear) to match weight scheme of original
         self.in_proj_weight = nn.Parameter(torch.randn((dim * 3, dim)) * self.scale)
-        self.custom_v_weight = nn.Parameter(torch.randn((self.num_heads, dim)) * self.scale)
         if qkv_bias:
             self.in_proj_bias = nn.Parameter(torch.zeros(dim * 3))
         else:
@@ -152,16 +123,13 @@ class Attention(nn.Module):
             self.head_scale = nn.Parameter(torch.ones((num_heads, 1, 1)))
         else:
             self.head_scale = None
-        # self.out_proj = nn.Linear(dim, dim)
-        # FIXME 输出一张子图
         self.out_proj = nn.Linear(dim, dim)
         self.out_drop = nn.Dropout(proj_drop)
 
     def forward(self, x, attn_mask: Optional[torch.Tensor] = None):
-        L, N, C = x.shape # （L-->子图数量，N--bs，C--特征长度）
+        L, N, C = x.shape
         q, k, v = F.linear(x, self.in_proj_weight, self.in_proj_bias).chunk(3, dim=-1)
-
-        q = q.contiguous().view(L, N * self.num_heads, -1).transpose(0, 1) # q size (bs*head, subfigs. _)
+        q = q.contiguous().view(L, N * self.num_heads, -1).transpose(0, 1)
         k = k.contiguous().view(L, N * self.num_heads, -1).transpose(0, 1)
         v = v.contiguous().view(L, N * self.num_heads, -1).transpose(0, 1)
 
@@ -172,38 +140,25 @@ class Attention(nn.Module):
             attn = attn.view(-1, L, L)
         else:
             q = q * self.scale
-            #乘出来为 （bs*head, sub_figs, sub_figs）代表每张子图对应的attention
-            attn = torch.bmm(q, k.transpose(-1, -2)) 
+            attn = torch.bmm(q, k.transpose(-1, -2))
 
-        attn = attn.contiguous().view(N, self.num_heads, -1, L)
         if attn_mask is not None:
-            # 因为是多头，需要在头的维度上先升一维
-            attn_mask = attn_mask.unsqueeze(1)
             if attn_mask.dtype == torch.bool:
                 new_attn_mask = torch.zeros_like(attn_mask, dtype=q.dtype)
                 new_attn_mask.masked_fill_(attn_mask, float("-inf"))
                 attn_mask = new_attn_mask
-            # FIXME 因为我们的attn mask由 1 和 -inf 组成，-inf代表mask掉的位置
-            # 所以将attn值乘上mask， ps：原代码中是相加
-            # attn += attn_mask
-            attn *= attn_mask
-        
-        attn = attn.contiguous().view(N * self.num_heads, -1, L)
+            attn += attn_mask
 
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        # FIXME x乘注意力
         x = torch.bmm(attn, v)
-        # x = torch.bmm(x.transpose(-1, -2), final_v)
         if self.head_scale is not None:
             x = x.view(N, self.num_heads, L, C) * self.head_scale
             x = x.view(-1, L, C)
-        # reshape 回原来的样子
         x = x.transpose(0, 1).reshape(L, N, C)
         x = self.out_proj(x)
         x = self.out_drop(x)
-
         return x
 
 
@@ -244,10 +199,7 @@ class ResidualAttentionBlock(nn.Module):
         super().__init__()
 
         self.ln_1 = norm_layer(d_model)
-        # FIXME 修改
         self.attn = nn.MultiheadAttention(d_model, n_head)
-        # FIXME attention修改
-        # self.attn = Attention(d_model, n_head)
         self.ls_1 = LayerScale(d_model, ls_init_value) if ls_init_value is not None else nn.Identity()
         if is_cross_attention:
             self.ln_1_kv = norm_layer(d_model)
@@ -261,7 +213,7 @@ class ResidualAttentionBlock(nn.Module):
         ]))
         self.ls_2 = LayerScale(d_model, ls_init_value) if ls_init_value is not None else nn.Identity()
 
-    def  attention(
+    def attention(
             self,
             q_x: torch.Tensor,
             k_x: Optional[torch.Tensor] = None,
@@ -273,8 +225,7 @@ class ResidualAttentionBlock(nn.Module):
 
         attn_mask = attn_mask.to(q_x.dtype) if attn_mask is not None else None
         return self.attn(
-            # FIXME 修改attn mask --> key_padding_mask
-            q_x, k_x, v_x, need_weights=False, key_padding_mask=attn_mask
+            q_x, k_x, v_x, need_weights=False, attn_mask=attn_mask
         )[0]
 
     def forward(
@@ -286,13 +237,11 @@ class ResidualAttentionBlock(nn.Module):
     ):
         k_x = self.ln_1_kv(k_x) if hasattr(self, "ln_1_kv") and k_x is not None else None
         v_x = self.ln_1_kv(v_x) if hasattr(self, "ln_1_kv") and v_x is not None else None
-        # FIXME attention mask参数修改
-
         x = q_x + self.ls_1(self.attention(q_x=self.ln_1(q_x), k_x=k_x, v_x=v_x, attn_mask=attn_mask))
         x = x + self.ls_2(self.mlp(self.ln_2(x)))
         return x
 
-# 这个可以自己修改一些
+
 class CustomResidualAttentionBlock(nn.Module):
     def __init__(
             self,
@@ -328,7 +277,6 @@ class CustomResidualAttentionBlock(nn.Module):
         ]))
         self.ls_2 = LayerScale(d_model, ls_init_value) if ls_init_value is not None else nn.Identity()
 
-
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
         x = x + self.ls_1(self.ln_attn(self.attn(self.ln_1(x), attn_mask=attn_mask)))
         x = x + self.ls_2(self.mlp(self.ln_2(x)))
@@ -354,25 +302,19 @@ class Transformer(nn.Module):
         self.width = width
         self.layers = layers
         self.grad_checkpointing = False
-
+        self.heads = heads
         self.resblocks = nn.ModuleList([
             ResidualAttentionBlock(
-            # FIXME 换成了这个自定义的attention
-            # CustomResidualAttentionBlock(
                 width, heads, mlp_ratio, ls_init_value=ls_init_value, act_layer=act_layer, norm_layer=norm_layer)
             for _ in range(layers)
         ])
-
-        # FIXME 
-        self.custom_resblocks = nn.ModuleList([
-            # FIXME 换成了这个自定义的attention
-            CustomResidualAttentionBlock(
-                width, heads, mlp_ratio, ls_init_value=ls_init_value, act_layer=act_layer, norm_layer=norm_layer)
-            for _ in range(layers)
-        ])
-
-        # FIXME 多层attention后 将输出维度缩减到一维
-        self.my_atten_layer = AttentionLayer(dimension=width)
+        # # # FIXME
+        # self.custom_resblocks = nn.ModuleList([
+        #     # FIXME 换成了这个自定义的attention
+        #     CustomResidualAttentionBlock(
+        #         width, heads, mlp_ratio, ls_init_value=ls_init_value, act_layer=act_layer, norm_layer=norm_layer)
+        #     for _ in range(layers)
+        # ])
 
     def get_cast_dtype(self) -> torch.dtype:
         if hasattr(self.resblocks[0].mlp.c_fc, 'int8_original_dtype'):
@@ -381,22 +323,20 @@ class Transformer(nn.Module):
 
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None,
                 custom_flag: bool = False):
+        # FIXME 修改
         if custom_flag:
-            for r in self.custom_resblocks:
-                if self.grad_checkpointing and not torch.jit.is_scripting():
-                    # TODO: handle kwargs https://github.com/pytorch/pytorch/issues/79887#issuecomment-1161758372
-                    x = checkpoint(r, x, None, None, attn_mask)
-                else:
-                    x = r(x, attn_mask=attn_mask)
-
-        else:
-            # FIXME 修改
-            for r in self.resblocks:
-                if self.grad_checkpointing and not torch.jit.is_scripting():
-                    # TODO: handle kwargs https://github.com/pytorch/pytorch/issues/79887#issuecomment-1161758372
-                    x = checkpoint(r, x, None, None, attn_mask)
-                else:
-                    x = r(x, attn_mask=attn_mask)
+            # import pdb
+            # pdb.set_trace()
+            ## N, L, D repeat-> N* head, L, D
+            if attn_mask is not None:
+                attn_mask = attn_mask.unsqueeze(1).repeat(1, self.heads, 1, 1)
+                attn_mask = attn_mask.view(attn_mask.size(0) * attn_mask.size(1), attn_mask.size(2), attn_mask.size(3))
+        for r in self.resblocks:
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                # TODO: handle kwargs https://github.com/pytorch/pytorch/issues/79887#issuecomment-1161758372
+                x = checkpoint(r, x, None, None, attn_mask)
+            else:
+                x = r(x, attn_mask=attn_mask)
         return x
 
 
@@ -423,12 +363,11 @@ class VisionTransformer(nn.Module):
             final_ln_after_pool: bool = False,
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = LayerNorm,
-            output_tokens: bool = False,
+            output_tokens: bool = True,
     ):
         super().__init__()
         assert pool_type in ('tok', 'avg', 'none')
         self.output_tokens = output_tokens
-
         image_height, image_width = self.image_size = to_2tuple(image_size)
         patch_height, patch_width = self.patch_size = to_2tuple(patch_size)
         self.grid_size = (image_height // patch_height, image_width // patch_width)
@@ -575,14 +514,15 @@ class VisionTransformer(nn.Module):
 
         return pooled, tokens
 
-    def forward(self, x: torch.Tensor):
-        x = self.conv1(x)  # shape = [*, width, grid, grid] --> grid代表子图的尺寸， 划分后一张大图有768个小图
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+    def forward(self, x: torch.Tensor, custom_flag: bool = False):
+        if not custom_flag:
+            x = self.conv1(x)  # shape = [*, width, grid, grid]
+            x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+            x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
 
-        # class embeddings and positional embeddings 添加CLS 输出类别信息 (bs, 768, 197)
-        x = torch.cat([_expand_token(self.class_embedding, x.shape[0]).to(x.dtype), x], dim=1) 
 
+        # class embeddings and positional embeddings
+        x = torch.cat([_expand_token(self.class_embedding, x.shape[0]).to(x.dtype), x], dim=1)
         # shape = [*, grid ** 2 + 1, width]
         x = x + self.positional_embedding.to(x.dtype)
 
@@ -590,9 +530,7 @@ class VisionTransformer(nn.Module):
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-
-        # 传入transformer的尺寸（sq_len, bs, dimension(attention的维度，大图维度上)）
-        x = self.transformer(x)
+        x = self.transformer(x, custom_flag = custom_flag)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         if self.attn_pool is not None:
@@ -614,7 +552,6 @@ class VisionTransformer(nn.Module):
             pooled, tokens = self._global_pool(x)
             pooled = self.ln_post(pooled)
         else:
-            # FIXME 这里
             x = self.ln_post(x)
             pooled, tokens = self._global_pool(x)
 
@@ -624,6 +561,167 @@ class VisionTransformer(nn.Module):
         if self.output_tokens:
             return pooled, tokens
         
+        return pooled
+
+
+class MyTransformer(nn.Module):
+    output_tokens: torch.jit.Final[bool]
+
+    def __init__(
+            self,
+            image_size: int,
+            patch_size: int,
+            width: int,
+            layers: int,
+            heads: int,
+            subfig_num: int,
+            mlp_ratio: float,
+            ls_init_value: float = None,
+            attentional_pool: bool = False,
+            attn_pooler_queries: int = 256,
+            attn_pooler_heads: int = 8,
+            output_dim: int = 512,
+            patch_dropout: float = 0.,
+            no_ln_pre: bool = False,
+            pos_embed_type: str = 'learnable',
+            pool_type: str = 'tok',
+            final_ln_after_pool: bool = False,
+            act_layer: Callable = nn.GELU,
+            norm_layer: Callable = LayerNorm,
+    ):
+        super().__init__()
+        assert pool_type in ('tok', 'avg', 'none')
+
+        image_height, image_width = self.image_size = to_2tuple(image_size)
+        patch_height, patch_width = self.patch_size = to_2tuple(patch_size)
+
+        self.grid_size = (image_height // patch_height, image_width // patch_width)
+        self.final_ln_after_pool = final_ln_after_pool  # currently ignored w/ attn pool enabled
+        self.output_dim = output_dim
+
+        # class embeddings and positional embeddings
+        scale = width ** -0.5
+        self.class_embedding = nn.Parameter(scale * torch.randn(width))
+        if pos_embed_type == 'learnable':
+
+            # FIXME 位置信息编码尺寸改变
+            self.positional_embedding = nn.Parameter(
+                scale * torch.randn(subfig_num + 1, width))
+
+        elif pos_embed_type == 'sin_cos_2d':
+            # fixed sin-cos embedding
+            assert self.grid_size[0] == self.grid_size[1], \
+                'currently sin cos 2d pos embedding only supports square input'
+
+            # FIXME 位置信息编码尺寸改变
+            self.positional_embedding = nn.Parameter(
+                torch.zeros(subfig_num + 1, width), requires_grad=False)
+            pos_embed_type = get_2d_sincos_pos_embed(width, self.grid_size[0], cls_token=True)
+
+            self.positional_embedding.data.copy_(torch.from_numpy(pos_embed_type).float())
+        else:
+            raise ValueError
+
+        # setting a patch_dropout of 0. would mean it is disabled and this function would be the identity fn
+        self.patch_dropout = PatchDropout(patch_dropout) if patch_dropout > 0. else nn.Identity()
+
+        self.ln_pre = nn.Identity() if no_ln_pre else norm_layer(width)
+        self.transformer = Transformer(
+            width,
+            layers,
+            heads,
+            mlp_ratio,
+            ls_init_value=ls_init_value,
+            act_layer=act_layer,
+            norm_layer=norm_layer,
+        )
+
+        if attentional_pool:
+            if isinstance(attentional_pool, str):
+                self.attn_pool_type = attentional_pool
+                self.pool_type = 'none'
+                if attentional_pool in ('parallel', 'cascade'):
+                    self.attn_pool = AttentionalPooler(
+                        output_dim,
+                        width,
+                        n_head=attn_pooler_heads,
+                        n_queries=attn_pooler_queries,
+                    )
+                    self.attn_pool_contrastive = AttentionalPooler(
+                        output_dim,
+                        width,
+                        n_head=attn_pooler_heads,
+                        n_queries=1,
+                    )
+                else:
+                    assert False
+            else:
+                self.attn_pool_type = ''
+                self.pool_type = pool_type
+                self.attn_pool = AttentionalPooler(
+                    output_dim,
+                    width,
+                    n_head=attn_pooler_heads,
+                    n_queries=attn_pooler_queries,
+                )
+                self.attn_pool_contrastive = None
+            pool_dim = output_dim
+        else:
+            self.attn_pool = None
+            pool_dim = width
+            self.pool_type = pool_type
+
+        self.ln_post = norm_layer(pool_dim)
+        self.proj = nn.Parameter(scale * torch.randn(pool_dim, output_dim))
+
+        self.init_parameters()
+
+    def init_parameters(self):
+        pass
+
+    @torch.jit.ignore
+    def set_grad_checkpointing(self, enable=True):
+        self.transformer.grad_checkpointing = enable
+
+    def _global_pool(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.pool_type == 'avg':
+            pooled, tokens = x[:, 1:].mean(dim=1), x[:, 1:]
+        elif self.pool_type == 'tok':
+            pooled, tokens = x[:, 0], x[:, 1:]
+        else:
+            pooled = tokens = x
+
+        return pooled, tokens
+
+    # FIXME wyh : 使用起来它的mask功能
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
+        # import pdb
+        # pdb.set_trace()
+        # 添加CLS 输出类别信息
+        x = torch.cat([_expand_token(self.class_embedding, x.shape[0]).to(x.dtype), x], dim=1)
+
+        # shape = [*, grid ** 2 + 1, width]
+        x = x + self.positional_embedding.to(x.dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+
+        # 传入transformer的尺寸（sq_len, bs, dimension(attention的维度，大图维度上)）
+        # x = self.transformer(x, attn_mask=attn_mask, custom_flag=True)
+        x = self.transformer(x, attn_mask=attn_mask, custom_flag=True)
+
+        x = x.permute(1, 0, 2)  # LND -> NLD
+
+        if self.attn_pool is not None:
+            pass
+        else:
+            # FIXME 这里
+            x = self.ln_post(x)
+            # 这里之后，输入维度为[bs, sub_fignum, feature_len]
+            # 输出的维度为[bs, feature_len]
+            pooled, tokens = self._global_pool(x)
+
+        if self.proj is not None:
+            pooled = pooled @ self.proj
+
         return pooled
 
 
@@ -732,7 +830,6 @@ class TextTransformer(nn.Module):
     def set_grad_checkpointing(self, enable=True):
         self.transformer.grad_checkpointing = enable
 
-    # FIXME text mask功能
     def build_causal_mask(self):
         # lazily create causal attention mask, with full attention between the tokens
         # pytorch uses additive attention mask; fill with -inf
@@ -882,166 +979,3 @@ class MultimodalTransformer(Transformer):
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
         self.grad_checkpointing = enable
-
-
-
-
-class MyTransformer(nn.Module):
-    output_tokens: torch.jit.Final[bool]
-
-    def __init__(
-            self,
-            image_size: int,
-            patch_size: int,
-            width: int,
-            layers: int,
-            heads: int,
-            subfig_num: int,
-            mlp_ratio: float,
-            ls_init_value: float = None,
-            attentional_pool: bool = False,
-            attn_pooler_queries: int = 256,
-            attn_pooler_heads: int = 8,
-            output_dim: int = 512,
-            patch_dropout: float = 0.,
-            no_ln_pre: bool = False,
-            pos_embed_type: str = 'learnable',
-            pool_type: str = 'tok',
-            final_ln_after_pool: bool = False,
-            act_layer: Callable = nn.GELU,
-            norm_layer: Callable = LayerNorm,
-    ):
-        super().__init__()
-        assert pool_type in ('tok', 'avg', 'none')
-
-        image_height, image_width = self.image_size = to_2tuple(image_size)
-        patch_height, patch_width = self.patch_size = to_2tuple(patch_size)
-
-        self.grid_size = (image_height // patch_height, image_width // patch_width)
-        self.final_ln_after_pool = final_ln_after_pool  # currently ignored w/ attn pool enabled
-        self.output_dim = output_dim
-
-        # class embeddings and positional embeddings
-        scale = width ** -0.5
-        self.class_embedding = nn.Parameter(scale * torch.randn(width))
-        if pos_embed_type == 'learnable':
-
-            # FIXME 位置信息编码尺寸改变
-            self.positional_embedding = nn.Parameter(
-                scale * torch.randn(subfig_num + 1, width))
-            
-        elif pos_embed_type == 'sin_cos_2d':
-            # fixed sin-cos embedding
-            assert self.grid_size[0] == self.grid_size[1],\
-                'currently sin cos 2d pos embedding only supports square input'
-        
-            # FIXME 位置信息编码尺寸改变
-            self.positional_embedding = nn.Parameter(
-                torch.zeros(subfig_num + 1, width), requires_grad=False)
-            pos_embed_type = get_2d_sincos_pos_embed(width, self.grid_size[0], cls_token=True)
-
-            self.positional_embedding.data.copy_(torch.from_numpy(pos_embed_type).float())
-        else:
-            raise ValueError
-
-        # setting a patch_dropout of 0. would mean it is disabled and this function would be the identity fn
-        self.patch_dropout = PatchDropout(patch_dropout) if patch_dropout > 0. else nn.Identity()
-
-        self.ln_pre = nn.Identity() if no_ln_pre else norm_layer(width)
-        self.transformer = Transformer(
-            width,
-            layers,
-            heads,
-            mlp_ratio,
-            ls_init_value=ls_init_value,
-            act_layer=act_layer,
-            norm_layer=norm_layer,
-        )
-
-        if attentional_pool:
-            if isinstance(attentional_pool, str):
-                self.attn_pool_type = attentional_pool
-                self.pool_type = 'none'
-                if attentional_pool in ('parallel', 'cascade'):
-                    self.attn_pool = AttentionalPooler(
-                        output_dim,
-                        width,
-                        n_head=attn_pooler_heads,
-                        n_queries=attn_pooler_queries,
-                    )
-                    self.attn_pool_contrastive = AttentionalPooler(
-                        output_dim,
-                        width,
-                        n_head=attn_pooler_heads,
-                        n_queries=1,
-                    )
-                else:
-                    assert False
-            else:
-                self.attn_pool_type = ''
-                self.pool_type = pool_type
-                self.attn_pool = AttentionalPooler(
-                    output_dim,
-                    width,
-                    n_head=attn_pooler_heads,
-                    n_queries=attn_pooler_queries,
-                )
-                self.attn_pool_contrastive = None
-            pool_dim = output_dim
-        else:
-            self.attn_pool = None
-            pool_dim = width
-            self.pool_type = pool_type
-
-        self.ln_post = norm_layer(pool_dim)
-        self.proj = nn.Parameter(scale * torch.randn(pool_dim, output_dim))
-
-        self.init_parameters()
-
-    def init_parameters(self):
-        pass
-
-    @torch.jit.ignore
-    def set_grad_checkpointing(self, enable=True):
-        self.transformer.grad_checkpointing = enable
-
-    def _global_pool(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.pool_type == 'avg':
-            pooled, tokens = x[:, 1:].mean(dim=1), x[:, 1:]
-        elif self.pool_type == 'tok':
-            pooled, tokens = x[:, 0], x[:, 1:]
-        else:
-            pooled = tokens = x
-
-        return pooled, tokens
-
-    # FIXME wyh : 使用起来它的mask功能
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
-        # x = self.conv1(x)  # shape = [*, width, grid, grid] --> grid代表子图的尺寸， 划分后一张大图有768个小图
-        # x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-        # x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-
-        # 添加CLS 输出类别信息
-        x = torch.cat([_expand_token(self.class_embedding, x.shape[0]).to(x.dtype), x], dim=1) 
-
-        # shape = [*, grid ** 2 + 1, width]
-        x = x + self.positional_embedding.to(x.dtype)
-        x = x.permute(1, 0, 2)  # NLD -> LND
-
-        # 传入transformer的尺寸（sq_len, bs, dimension(attention的维度，大图维度上)）
-        x = self.transformer(x, attn_mask=attn_mask, custom_flag=True)
-        x = x.permute(1, 0, 2)  # LND -> NLD
-
-        if self.attn_pool is not None:
-            pass
-        else:
-            # FIXME 这里
-            x = self.ln_post(x)
-            # 这里之后，输入维度为[bs, sub_fignum, feature_len]
-            # 输出的维度为[bs, feature_len]
-            pooled, tokens = self._global_pool(x)
-
-        if self.proj is not None:
-            pooled = pooled @ self.proj
-        
-        return pooled

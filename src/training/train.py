@@ -61,20 +61,6 @@ def backward(total_loss, scaler):
         total_loss.backward()
 
 
-# FIXME 裁剪函数
-def crop_and_merge_old(images, h, w):
-    (bs, _, height, width) = images.shape
-    # 分块 eg (bs, 3, 224, 224)
-    # FIXME 更新方法为view
-    images = images.contiguous().view(bs, 3, height, w, width // w)
-    images = images.contiguous().view(bs, 3, h, height // h, w, width // w )
-    images = images.permute(0, 2, 4, 1, 3, 5 )
-    images = images.contiguous().view(-1, 3, height // h, width // w )
-
-    return images
-
-
-
 def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=None):
     device = torch.device(args.device)
     autocast = get_autocast(args.precision)
@@ -90,7 +76,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
     sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
 
     if args.accum_freq > 1:
-        accum_images, accum_texts, accum_features = [], [], {}
+        accum_images, accum_texts, accum_attns, accum_features = [], [], [], {}
 
     losses_m = {}
     batch_time_m = AverageMeter()
@@ -103,32 +89,21 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
         if not args.skip_scheduler:
             scheduler(step)
 
-        images, texts = batch
-
-        # FIXME 初始化mask，保存batch/子图中为全零向量的索引
-        sums = images.view(-1, args.max_subfigs, 3*args.subfig_size**2).sum(dim=2)
-        # indices = (sums == 0).nonzero(as_tuple=True)[0]
-        indices = [(i, j) for i in range(sums.shape[0]) for j in range(sums.shape[1]) if (sums[i, j] == 0).all()]
-        
-        # FIXME 将切分的子图并到bs里准备输入网络
-        images = images.contiguous().view(-1, 3, args.subfig_size, args.subfig_size)
-
-
+        images, texts, attn_mask = batch
         images = images.to(device=device, dtype=input_dtype, non_blocking=True)
         texts = texts.to(device=device, non_blocking=True)
-
-        
+        attn_mask = attn_mask.to(device=device, non_blocking=True)
 
         data_time_m.update(time.time() - end)
         optimizer.zero_grad()
 
         if args.accum_freq == 1:
             with autocast():
-                model_out = model(images, texts, max_subfigs=args.max_subfigs, indices=indices, device=args.device)
+                model_out = model(images, texts, attn_mask, args.freeze_text, args.freeze_image)
                 logit_scale = model_out["logit_scale"]
                 if args.distill:
                     with torch.no_grad():
-                        dist_model_out = dist_model(images, texts, max_subfigs=args.max_subfigs, indices=indices, device=args.device)
+                        dist_model_out = dist_model(images, texts, attn_mask, args.freeze_text, args.freeze_image)
                     model_out.update({f'dist_{k}': v for k, v in dist_model_out.items()})
                 losses = loss(**model_out, output_dict=True)
 
@@ -140,7 +115,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
             # First, cache the features without any gradient tracking.
             with torch.no_grad():
                 with autocast():
-                    model_out = model(images, texts, max_subfigs=args.max_subfigs, indices=indices, device=args.device)
+                    model_out = model(images, texts, attn_mask, args.freeze_text, args.freeze_image)
 
                     for f in ("logit_scale", "logit_bias"):
                         model_out.pop(f, None)
@@ -153,6 +128,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
                 accum_images.append(images)
                 accum_texts.append(texts)
+                accum_attns.append(attn_mask)
 
             # If (i + 1) % accum_freq is not zero, move on to the next batch.
             if ((i + 1) % args.accum_freq) > 0:
@@ -166,8 +142,9 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
             for j in range(args.accum_freq):
                 images = accum_images[j]
                 texts = accum_texts[j]
+                attn_mask = accum_attns[j]
                 with autocast():
-                    model_out = model(images, texts)
+                    model_out = model(images, texts, attn_mask, args.freeze_text, args.freeze_image)
 
                     inputs_no_accum = {}
                     inputs_no_accum["logit_scale"] = logit_scale = model_out.pop("logit_scale")
@@ -208,7 +185,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
         # reset gradient accum, if enabled
         if args.accum_freq > 1:
-            accum_images, accum_texts, accum_features = [], [], {}
+            accum_images, accum_texts, accum_attns, accum_features = [], [], [], {}
 
         # Note: we clamp to 4.6052 = ln(100), as in the original paper.
         with torch.no_grad():

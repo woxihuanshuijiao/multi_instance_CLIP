@@ -167,3 +167,16 @@ tutorials/
 LICENSE
 HISTORY.md
 debug.sh
+
+check
+
+quilt_1m_croped_part*
+
+1m.csv
+
+record
+
+both_freeze.sh
+freeze_image.sh
+freeze_text.sh
+not_freeze.sh

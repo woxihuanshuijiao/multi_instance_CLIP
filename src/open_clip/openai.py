@@ -69,6 +69,8 @@ def load_openai_model(
 
     # Build a non-jit model from the OpenAI jitted model state dict
     cast_dtype = get_cast_dtype(precision)
+
+    ####################### FIXME build_model_from_openai_state_dict load模型的dict ############3
     try:
         model = build_model_from_openai_state_dict(state_dict or model.state_dict(), cast_dtype=cast_dtype)
     except KeyError:

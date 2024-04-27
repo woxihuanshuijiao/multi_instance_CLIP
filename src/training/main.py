@@ -4,7 +4,7 @@ PATH = '/home/wangyuhan/clip/open_clip/'
 sys.path.append(PATH)
 import glob
 import logging
-
+import os
 import re
 import subprocess
 import sys
@@ -42,10 +42,9 @@ from src.training.scheduler import cosine_lr, const_lr, const_lr_cooldown
 from src.training.train import train_one_epoch, evaluate
 from src.training.file_utils import pt_load, check_exists, start_sync_process, remote_sync
 
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 LATEST_CHECKPOINT_NAME = "epoch_latest.pt"
-
+# os.environ['CUDA_VISIBLE_DEVICES'] = '5'
 
 def random_seed(seed=42, rank=0):
     torch.manual_seed(seed + rank)
@@ -302,7 +301,7 @@ def main(args):
         if args.ddp_static_graph:
             # this doesn't exist in older PyTorch, arg only added if enabled
             ddp_args['static_graph'] = True
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], **ddp_args)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], find_unused_parameters=True, **ddp_args)
     
         if args.distill:
             dist_model = torch.nn.parallel.DistributedDataParallel(dist_model, device_ids=[device], **ddp_args)
@@ -320,7 +319,9 @@ def main(args):
         named_parameters = list(model.named_parameters())
         gain_or_bias_params = [p for n, p in named_parameters if exclude(n, p) and p.requires_grad]
         rest_params = [p for n, p in named_parameters if include(n, p) and p.requires_grad]
-
+        ## exlude clip text and image encoder params
+        # import pdb
+        # pdb.set_trace()
         optimizer = optim.AdamW(
             [
                 {"params": gain_or_bias_params, "weight_decay": 0.},
@@ -341,6 +342,8 @@ def main(args):
     start_epoch = 0
     if args.resume is not None:
         checkpoint = pt_load(args.resume, map_location='cpu')
+        # import  pdb
+        # pdb.set_trace()
         if 'epoch' in checkpoint:
             # resuming a train checkpoint w/ epoch and optimizer state
             start_epoch = checkpoint["epoch"]
@@ -354,11 +357,21 @@ def main(args):
                 scaler.load_state_dict(checkpoint['scaler'])
             logging.info(f"=> resuming checkpoint '{args.resume}' (epoch {start_epoch})")
         else:
-            # loading a bare (model only) checkpoint for fine-tune or evaluation
-            model.load_state_dict(checkpoint)
+            model.load_state_dict(checkpoint, strict=False)
             logging.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
 
-    # FIXME 数据集初始化
+
+
+            # modify key of the model to copy the weights
+            # state_dict = checkpoint['state_dict']
+            # new_state_dict = {}
+            # for k, v in state_dict.items():
+            #     new_key = k.replace('module.', '')  # 去除前缀
+            #     new_state_dict[new_key] = v
+            # model.load_state_dict(new_state_dict, strict=False)
+
+
+    # initialize datasets
     tokenizer = get_tokenizer(args.model)
     data = get_data(
         args,

@@ -15,15 +15,19 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 from functools import partial
 
-from .hf_model import HFTextEncoder
+from .hf_model import HFTextEncoder, arch_dict
 from .modified_resnet import ModifiedResNet
 from .timm_model import TimmModel
-from .transformer import LayerNormFp32, LayerNorm, QuickGELU, Attention, VisionTransformer, TextTransformer,\
-    text_global_pool, AttentionLayer, Transformer, MyTransformer
+from .transformer import LayerNormFp32, LayerNorm, QuickGELU, Attention, VisionTransformer, TextTransformer, \
+    text_global_pool, MyTransformer,AttentionalPooler
 from .utils import to_2tuple
 
 
-
+## from coca
+# from transformer import AttentionalPooler
+from torch import einsum, nn
+import torch.nn.functional as F
+from einops import rearrange, repeat
 
 
 @dataclass
@@ -33,7 +37,6 @@ class CLIPVisionCfg:
     head_width: int = 64
     mlp_ratio: float = 4.0
     patch_size: int = 16
-    # FIXME x
     image_size: Union[Tuple[int, int], int] = 224
 
     ls_init_value: Optional[float] = None  # layer scale initial value
@@ -56,6 +59,14 @@ class CLIPVisionCfg:
     timm_proj_bias: bool = False  # enable bias final projection
     timm_drop: float = 0.  # head dropout
     timm_drop_path: Optional[float] = None  # backbone stochastic depth
+
+# FIXME 修改处
+@dataclass
+class MyTransformerCfg:
+    width: int = 1024
+    num_heads: int = 4
+    layers: int = 2
+    subfig_num: int = 576
 
 
 @dataclass
@@ -87,15 +98,6 @@ class CLIPTextCfg:
     hf_pooler_type: str = 'mean_pooler'  # attentional pooling for HF models
 
 
-# FIXME 修改处
-@dataclass
-class MyTransformerCfg:
-    width: int = 512
-    num_heads: int = 6
-    layers: int = 3
-    subfig_num: int = 6
-
-
 def get_cast_dtype(precision: str):
     cast_dtype = None
     if precision == 'bf16':
@@ -112,44 +114,6 @@ def get_input_dtype(precision: str):
     elif precision in ('fp16', 'pure_fp16'):
         input_dtype = torch.float16
     return input_dtype
-
-
-# FIXME attention层，模仿
-def _build_attention_layer(embed_dim: int, mytransformer_cfg: MyTransformerCfg, vision_cfg : CLIPVisionCfg, quick_gelu :bool = False, 
-                           cast_dtype: Optional[torch.dtype] = None,):
-    transformer_heads = mytransformer_cfg.width // vision_cfg.head_width
-    
-    act_layer = QuickGELU if quick_gelu else nn.GELU
-
-    norm_layer = LayerNormFp32 if cast_dtype in (torch.float16, torch.bfloat16) else LayerNorm
-    if vision_cfg.norm_kwargs:
-        norm_layer = partial(norm_layer, **vision_cfg.norm_kwargs)
-    if vision_cfg.act_kwargs is not None:
-        act_layer = partial(act_layer, **vision_cfg.act_kwargs)
-
-
-    attenton_layer = MyTransformer(image_size=vision_cfg.image_size,
-            patch_size=vision_cfg.patch_size,
-            width=mytransformer_cfg.width,
-            layers=mytransformer_cfg.layers,
-            heads=transformer_heads,
-            subfig_num=mytransformer_cfg.subfig_num,
-            mlp_ratio=vision_cfg.mlp_ratio,
-            ls_init_value=vision_cfg.ls_init_value,
-            patch_dropout=vision_cfg.patch_dropout,
-            attentional_pool=vision_cfg.attentional_pool,
-            attn_pooler_queries=vision_cfg.attn_pooler_queries,
-            attn_pooler_heads=vision_cfg.attn_pooler_heads,
-            pos_embed_type=vision_cfg.pos_embed_type,
-            no_ln_pre=vision_cfg.no_ln_pre,
-            final_ln_after_pool=vision_cfg.final_ln_after_pool,
-            pool_type=vision_cfg.pool_type,
-            output_dim=embed_dim,
-            act_layer=act_layer,
-            norm_layer=norm_layer,)
-
-    
-    return attenton_layer
 
 
 def _build_vision_tower(
@@ -196,6 +160,7 @@ def _build_vision_tower(
         if vision_cfg.act_kwargs is not None:
             act_layer = partial(act_layer, **vision_cfg.act_kwargs)
 
+        # FIXME Modify output_tokens to True
         visual = VisionTransformer(
             image_size=vision_cfg.image_size,
             patch_size=vision_cfg.patch_size,
@@ -212,13 +177,50 @@ def _build_vision_tower(
             no_ln_pre=vision_cfg.no_ln_pre,
             final_ln_after_pool=vision_cfg.final_ln_after_pool,
             pool_type=vision_cfg.pool_type,
-            output_tokens=vision_cfg.output_tokens,
+            output_tokens=True,
             output_dim=embed_dim,
             act_layer=act_layer,
             norm_layer=norm_layer,
         )
 
     return visual
+
+
+# FIXME attention层，模仿
+def _build_attention_layer(embed_dim: int, mytransformer_cfg: MyTransformerCfg, vision_cfg: CLIPVisionCfg,
+                           quick_gelu: bool = False,
+                           cast_dtype: Optional[torch.dtype] = None, ):
+    transformer_heads = mytransformer_cfg.width // vision_cfg.head_width
+
+    act_layer = QuickGELU if quick_gelu else nn.GELU
+
+    norm_layer = LayerNormFp32 if cast_dtype in (torch.float16, torch.bfloat16) else LayerNorm
+    if vision_cfg.norm_kwargs:
+        norm_layer = partial(norm_layer, **vision_cfg.norm_kwargs)
+    if vision_cfg.act_kwargs is not None:
+        act_layer = partial(act_layer, **vision_cfg.act_kwargs)
+
+    attenton_layer = MyTransformer(image_size=vision_cfg.image_size,
+                                   patch_size=vision_cfg.patch_size,
+                                   width=mytransformer_cfg.width,
+                                   layers=mytransformer_cfg.layers,
+                                   heads=transformer_heads,
+                                   subfig_num=mytransformer_cfg.subfig_num,
+                                   mlp_ratio=vision_cfg.mlp_ratio,
+                                   ls_init_value=vision_cfg.ls_init_value,
+                                   patch_dropout=vision_cfg.patch_dropout,
+                                   attentional_pool=vision_cfg.attentional_pool,
+                                   attn_pooler_queries=vision_cfg.attn_pooler_queries,
+                                   attn_pooler_heads=vision_cfg.attn_pooler_heads,
+                                   pos_embed_type=vision_cfg.pos_embed_type,
+                                   no_ln_pre=vision_cfg.no_ln_pre,
+                                   final_ln_after_pool=vision_cfg.final_ln_after_pool,
+                                   pool_type=vision_cfg.pool_type,
+                                   output_dim=embed_dim,
+                                   act_layer=act_layer,
+                                   norm_layer=norm_layer, )
+
+    return attenton_layer
 
 
 def _build_text_tower(
@@ -268,6 +270,91 @@ def _build_text_tower(
     return text
 
 
+
+# classic Noam Shazeer paper, except here they use SwiGLU instead of the more popular GEGLU for gating the feedforward
+# https://arxiv.org/abs/2002.05202
+
+
+class SwiGLU(nn.Module):
+    def forward(self, x):
+        x, gate = x.chunk(2, dim=-1)
+        return F.silu(gate) * x
+
+def exists(val):
+    return val is not None
+
+def default(val, d):
+    return val if exists(val) else d
+
+class CrossAttention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        context_dim=None,
+        dim_head=64,
+        heads=8,
+        parallel_ff=False,
+        ff_mult=4,
+        norm_context=False
+    ):
+        super().__init__()
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+        inner_dim = heads * dim_head
+        context_dim = default(context_dim, dim)
+        self.norm = LayerNorm(dim)
+        self.context_norm = LayerNorm(context_dim) if norm_context else nn.Identity()
+        self.to_q = nn.Linear(dim, inner_dim, bias=False)
+        self.to_kv = nn.Linear(context_dim, dim_head * 2, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim, bias=False)
+        # whether to have parallel feedforward
+
+        ff_inner_dim = ff_mult * dim
+
+        self.ff = nn.Sequential(
+            nn.Linear(dim, ff_inner_dim * 2, bias=False),
+            SwiGLU(),
+            nn.Linear(ff_inner_dim, dim, bias=False)
+        ) if parallel_ff else None
+
+    def forward(self, x, context):
+        """
+        einstein notation
+        b - batch
+        h - heads
+        n, i, j - sequence length (base sequence length, source, target)
+        d - feature dimension
+        """
+        # pre-layernorm, for queries and context
+        # import pdb
+        # pdb.set_trace()
+        x = self.norm(x)
+        context = self.context_norm(context)
+        # get queries
+        q = self.to_q(x)
+        q = rearrange(q, 'b n (h d) -> b h n d', h = self.heads)
+        # scale
+        q = q * self.scale
+        # get key / values
+        k, v = self.to_kv(context).chunk(2, dim=-1)
+        # query / key similarity
+        sim = einsum('b h i d, b j d -> b h i j', q, k)
+        # attention
+        sim = sim - sim.amax(dim=-1, keepdim=True)
+        attn = sim.softmax(dim=-1)
+        # aggregate
+        out = einsum('b h i j, b j d -> b h i d', attn, v)
+        # merge and combine heads
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        out = self.to_out(out)
+        # add parallel feedforward (for multimodal layers)
+        if exists(self.ff):
+            out = out + self.ff(x)
+
+        return out
+
+
 class CLIP(nn.Module):
     output_dict: torch.jit.Final[bool]
 
@@ -276,21 +363,18 @@ class CLIP(nn.Module):
             embed_dim: int,
             vision_cfg: CLIPVisionCfg,
             text_cfg: CLIPTextCfg,
-            mytransformer_cfg: MyTransformerCfg, #FIXME 已修改
-
+            mytransformer_cfg: MyTransformerCfg,  # FIXME 已修改
             quick_gelu: bool = False,
             init_logit_scale: float = np.log(1 / 0.07),
             init_logit_bias: Optional[float] = None,
             cast_dtype: Optional[torch.dtype] = None,
             output_dict: bool = False,
-
     ):
         super().__init__()
         self.output_dict = output_dict
 
         # FIXME 此处生硬指定，可以改
         self.attention_layer = _build_attention_layer(embed_dim, mytransformer_cfg, vision_cfg, quick_gelu, cast_dtype)
-
         self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu, cast_dtype)
 
         text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype)
@@ -304,6 +388,30 @@ class CLIP(nn.Module):
         self.text_pool_type = text.pool_type
         self.register_buffer('attn_mask', text.attn_mask, persistent=False)
 
+        # FIXME added fix parameter
+        self.max_subfigs = 6
+        self.attention_max_tokens = 576
+
+        ############ FIXME global images ##########
+        self.total_figs = self.max_subfigs + 1
+
+        self.num_img_queries = self.attention_max_tokens // self.total_figs
+
+        # FIXME Add image queries
+        # self.img_queries = nn.Parameter(torch.randn(self.num_img_queries,
+        #                                             vision_cfg.width))  # num image queries for multimodal, but 1 extra CLS for contrastive learning
+        # self.img_attn_pool = CrossAttention(dim=vision_cfg.width, context_dim=vision_cfg.width, dim_head=128, heads=8,
+        #                                     norm_context=True)
+
+        # transformer version's attention pool
+        self.img_attn_pool = AttentionalPooler(
+            vision_cfg.width,
+            vision_cfg.width,
+            n_head=8,
+            n_queries= 576 // self.total_figs,
+        )
+        self.img_attn_pool_norm = LayerNorm(vision_cfg.width)
+
         self.logit_scale = nn.Parameter(torch.ones([]) * init_logit_scale)
         if init_logit_bias is not None:
             self.logit_bias = nn.Parameter(torch.ones([]) * init_logit_bias)
@@ -314,21 +422,77 @@ class CLIP(nn.Module):
         # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
         self.visual.lock(unlocked_groups=unlocked_groups, freeze_bn_stats=freeze_bn_stats)
 
+    ## lock text冻结text encoder参数
+    def lock_text_tower(self, unlocked_layers: int = 0, freeze_layer_norm: bool = True):
+
+        if not unlocked_layers:  # full freezing
+            for n, p in self.transformer.named_parameters():
+                p.requires_grad = (not freeze_layer_norm) if "LayerNorm" in n.split(".") else False
+            return
+
+        encoder = self.transformer.encoder if hasattr(self.transformer, 'encoder') else self.transformer
+        layer_list = getattr(encoder, arch_dict[self.config.model_type]["config_names"]["layer_attr"])
+        print(f"Unlocking {unlocked_layers}/{len(layer_list) + 1} layers of hf model")
+        embeddings = getattr(
+            self.transformer, arch_dict[self.config.model_type]["config_names"]["token_embeddings_attr"])
+        modules = [embeddings, *layer_list][:-unlocked_layers]
+        # freeze layers
+        for module in modules:
+            for n, p in module.named_parameters():
+                p.requires_grad = (not freeze_layer_norm) if "LayerNorm" in n.split(".") else False
+
+        ## lock position embedding
+        self.positional_embedding.requires_grad = False
+        ## lock token embedding
+        self.token_embedding.requires_grad = False
+        ## lock text projection
+        if self.text_projection is not None:
+            self.text_projection.requires_grad = False
+
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
         self.visual.set_grad_checkpointing(enable)
         self.attention_layer.set_grad_checkpointing(enable)
         self.transformer.grad_checkpointing = enable
-    
-    # FIXME 此处修改
-    def attention_comp(self, features, attn_mask):
-        attention_features = self.attention_layer(features, attn_mask)
-        return attention_features
 
-    # FIXME 全部改成attention
-    def encode_image(self, image, normalize: bool = False):
-        features = self.visual(image)
-        return F.normalize(features, dim=-1) if normalize else features
+
+    def encode_image_patch(self, image, normalize: bool = False):
+        # FixME Add image tokens
+        # features, _ = self.visual(image)
+        # return F.normalize(features, dim=-1) if normalize else features
+        _, image_tokens = self.visual(image)
+        return F.normalize(image_tokens, dim=-1) if normalize else image_tokens
+
+    def encode_image_bag(self, image, attn_mask, normalize: bool = True):
+        image = image.contiguous().view(-1, image.shape[-3], image.shape[-2], image.shape[-1])
+        image_features = self.encode_image_patch(image, normalize=False) if image is not None else None  ## b, n_tokens (576), d
+        # image_tokens = image_features.unsqueeze(1)  # b, 1,  d
+        image_tokens = self.compress_image_tokens(image_features)  ## b, n_queries, d
+        (bs, token_num, feature_len) = image_tokens.shape
+        image_tokens = image_tokens.contiguous().view(bs // self.total_figs, self.total_figs, token_num,
+                                                      feature_len)
+        ## merge dim 1 & 2
+        image_tokens = image_tokens.view(bs // self.total_figs, -1, feature_len)   ## 564
+        image_panel = torch.zeros((bs // self.total_figs, self.attention_max_tokens, feature_len),
+                                  dtype=image_tokens.dtype, device=image_tokens.device)
+        image_panel[:, :image_tokens.size(1), :] = image_tokens
+        # # mask填充好后，扩展至输出维度
+        broadcast_ones = torch.ones((bs // self.total_figs, self.attention_max_tokens + 1, 1),
+                                    dtype=image_features.dtype, device=image_features.device)
+        attn_mask = attn_mask.unsqueeze(1)
+        attn_mask = broadcast_ones * attn_mask
+
+        ## transfer to true/ false mask
+        attn_mask = attn_mask.bool()
+        attn_mask = attn_mask.to(device=image_tokens.device, dtype=image_tokens.dtype)
+        # import pdb
+        # pdb.set_trace()
+        image_features = self.attention_comp(image_panel, attn_mask)
+        return F.normalize(image_features, dim=-1) if normalize else image_features
+        # image_panel = image_panel.permute(1, 0, 2)  # NLD -> LND
+        # image_features, _ = self.visual(image_panel, custom_flag =True)
+        # image_features = image_features.permute(1, 0, 2)  # LND -> NLD
+    
 
     def encode_text(self, text, normalize: bool = False):
         cast_dtype = self.transformer.get_cast_dtype()
@@ -337,7 +501,7 @@ class CLIP(nn.Module):
 
         x = x + self.positional_embedding.to(cast_dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        x = self.transformer(x, attn_mask=self.attn_mask)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x)  # [batch_size, n_ctx, transformer.width]
         x, _ = text_global_pool(x, text, self.text_pool_type)
@@ -349,65 +513,49 @@ class CLIP(nn.Module):
 
         return F.normalize(x, dim=-1) if normalize else x
 
+    # FIXME Add compress_image_tokens
+    def compress_image_tokens(self, image_tokens):
+        # img_queries = repeat(self.img_queries, 'n d -> b n d', b=image_tokens.shape[0])
+        # img_queries = self.img_attn_pool(img_queries, image_tokens)
+        # image_tokens = self.img_attn_pool_norm(img_queries)
+        # import pdb
+        # pdb.set_trace()
+        image_tokens = self.img_attn_pool(image_tokens)
+        return image_tokens
+
+    # FIXME 此处修改
+    def attention_comp(self, features, attn_mask):
+        attention_features = self.attention_layer(features, attn_mask)
+        return attention_features
+
+
     def get_logits(self, image, text):
-        image_features = self.encode_image(image, normalize=True)
+        # image_features = self.encode_image(image, normalize=True)
+        # 这里不使用默认的normalize，在
+        image_features = self.encode_image_bag(image, normalize=False)
+
         text_features = self.encode_text(text, normalize=True)
         image_logits = self.logit_scale.exp() * image_features @ text_features.T
         if self.logit_bias is not None:
             image_logits += self.logit_bias
         text_logits = image_logits.T
         return image_logits, text_logits
-    
-
-    
-    
 
     def forward(
             self,
             image: Optional[torch.Tensor] = None,
             text: Optional[torch.Tensor] = None,
             attn_mask: Optional[torch.Tensor] = None,
-            max_subfigs: int = 4,
-            indices: Optional[torch.dtype] = None,
-            device: str = None,
+            freeze_text: int = 0,
+            freeze_image: int = 0,
     ):
-        image_features = self.encode_image(image, normalize=True) if image is not None else None
-
-        # FIXME 修改部分
-        # 对图像特征进行reshape准备进入并计算attention值
-        (bs, feature_len) = image_features.shape
-
-        # FIXME 初始化mask
-        # mask将需要mask的地方补为-inf 形状(bs, 1, 子图数)
-        attn_mask = torch.ones((bs//max_subfigs, 1, max_subfigs), dtype=image_features.dtype)
-        # 根据之前的记录进行mask填充
-        for batch, subfigs in indices:
-            torch.fill_(attn_mask[batch, :, subfigs], -float('inf')) 
-
-        # 为了匹配CLS信息，CLS信息不mask，添加一列全1
-        attn_mask = torch.cat((torch.ones((bs//max_subfigs, 1, 1), dtype=image_features.dtype), attn_mask)
-                  , dim=2)
-        
-        # # mask填充好后，扩展至输出维度
-        broadcast_ones = torch.ones((bs//max_subfigs, max_subfigs, 1), dtype=image_features.dtype)
-        # 同样，在广播前，保证维度统一，需要将广播的矩阵也扩展一维，在最前添加一行
-        broadcast_ones = torch.cat((torch.ones((bs//max_subfigs, 1, 1), dtype=image_features.dtype), broadcast_ones)
-                  , dim=1)
-        
-        # 广播 在我们的例子（6张子图）下，mask的形状为（bs，7 ，7）
-        attn_mask = broadcast_ones * attn_mask
-        attn_mask = attn_mask.to(device=torch.device(device), dtype=image_features.dtype, non_blocking=True)
-        
-
-        # ！切割后的子图数量需要传进模型中 (bs, figs, dim)
-        image_features = image_features.contiguous().view(bs//max_subfigs, max_subfigs, feature_len)
-
-        
-        # 计算attention值 在bags的维度上，计算每张子图的attention
-        # image_features = image_features.permute(1, 0, 2)
-        image_features = self.attention_comp(image_features, attn_mask)
-
-        text_features = self.encode_text(text, normalize=True) if text is not None else None
+        # import pdb
+        # pdb.set_trace()
+        # 是否冻结参数，冻结参数就使用no_grad()
+        # FIXME 冻结参数，确定为冻结text，不冻结image
+        with torch.no_grad():
+            text_features = self.encode_text(text, normalize=True) if text is not None else None
+        image_features = self.encode_image_bag(image, attn_mask, normalize=True) if image is not None else None
 
         if self.output_dict:
             out_dict = {
@@ -511,9 +659,7 @@ def convert_weights_to_lp(model: nn.Module, dtype=torch.float16):
             if l.bias is not None:
                 l.bias.data = l.bias.data.to(dtype)
 
-        # FIXME 修改
-                # , Attention
-        if isinstance(l, (nn.MultiheadAttention)):
+        if isinstance(l, (nn.MultiheadAttention, Attention)):
             for attr in [*[f"{s}_proj_weight" for s in ["in", "q", "k", "v"]], "in_proj_bias", "bias_k", "bias_v"]:
                 tensor = getattr(l, attr)
                 if tensor is not None:
@@ -556,6 +702,8 @@ def convert_to_custom_text_state_dict(state_dict: dict):
     return state_dict
 
 
+################# FIXME load state dict ####################
+
 def build_model_from_openai_state_dict(
         state_dict: dict,
         quick_gelu=True,
@@ -587,6 +735,37 @@ def build_model_from_openai_state_dict(
     transformer_heads = transformer_width // 64
     transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith(f"transformer.resblocks")))
 
+    ################ FIXME 拷贝mytransformer参数 ###################
+    state_dict.update({'attention_layer.class_embedding': state_dict['visual.class_embedding']})
+    state_dict.update({'attention_layer.positional_embedding': state_dict['visual.positional_embedding']})
+    state_dict.update({'attention_layer.transformer.resblocks.0.attn.in_proj_weight': state_dict['visual.transformer.resblocks.22.attn.in_proj_weight']})
+    state_dict.update({'attention_layer.transformer.resblocks.0.attn.in_proj_bias': state_dict['visual.transformer.resblocks.22.attn.in_proj_bias']})
+    state_dict.update({'attention_layer.transformer.resblocks.0.attn.out_proj.weight': state_dict['visual.transformer.resblocks.22.attn.out_proj.weight']})
+    state_dict.update({'attention_layer.transformer.resblocks.0.attn.out_proj.bias': state_dict['visual.transformer.resblocks.22.attn.out_proj.bias']})
+    state_dict.update({'attention_layer.transformer.resblocks.0.ln_1.weight': state_dict['visual.transformer.resblocks.22.ln_1.weight']})
+    state_dict.update({'attention_layer.transformer.resblocks.0.ln_1.bias': state_dict['visual.transformer.resblocks.22.ln_1.bias']})
+    state_dict.update({'attention_layer.transformer.resblocks.0.mlp.c_fc.weight': state_dict['visual.transformer.resblocks.22.mlp.c_fc.weight']})
+    state_dict.update({'attention_layer.transformer.resblocks.0.mlp.c_fc.bias': state_dict['visual.transformer.resblocks.22.mlp.c_fc.bias']})
+    state_dict.update({'attention_layer.transformer.resblocks.0.mlp.c_proj.weight': state_dict['visual.transformer.resblocks.22.mlp.c_proj.weight']})
+    state_dict.update({'attention_layer.transformer.resblocks.0.mlp.c_proj.bias': state_dict['visual.transformer.resblocks.22.mlp.c_proj.bias']})
+    state_dict.update({'attention_layer.transformer.resblocks.0.ln_2.weight': state_dict['visual.transformer.resblocks.22.ln_2.weight']})
+    state_dict.update({'attention_layer.transformer.resblocks.0.ln_2.bias': state_dict['visual.transformer.resblocks.22.ln_2.bias']})
+
+    state_dict.update({'attention_layer.transformer.resblocks.1.attn.in_proj_weight': state_dict['visual.transformer.resblocks.23.attn.in_proj_weight']})
+    state_dict.update({'attention_layer.transformer.resblocks.1.attn.in_proj_bias': state_dict['visual.transformer.resblocks.23.attn.in_proj_bias']})
+    state_dict.update({'attention_layer.transformer.resblocks.1.attn.out_proj.weight': state_dict['visual.transformer.resblocks.23.attn.out_proj.weight']})
+    state_dict.update({'attention_layer.transformer.resblocks.1.attn.out_proj.bias': state_dict['visual.transformer.resblocks.23.attn.out_proj.bias']})
+    state_dict.update({'attention_layer.transformer.resblocks.1.ln_1.weight': state_dict['visual.transformer.resblocks.23.ln_1.weight']})
+    state_dict.update({'attention_layer.transformer.resblocks.1.ln_1.bias': state_dict['visual.transformer.resblocks.23.ln_1.bias']})
+    state_dict.update({'attention_layer.transformer.resblocks.1.mlp.c_fc.weight': state_dict['visual.transformer.resblocks.23.mlp.c_fc.weight']})
+    state_dict.update({'attention_layer.transformer.resblocks.1.mlp.c_fc.bias': state_dict['visual.transformer.resblocks.23.mlp.c_fc.bias']})
+    state_dict.update({'attention_layer.transformer.resblocks.1.mlp.c_proj.weight': state_dict['visual.transformer.resblocks.23.mlp.c_proj.weight']})
+    state_dict.update({'attention_layer.transformer.resblocks.1.mlp.c_proj.bias': state_dict['visual.transformer.resblocks.23.mlp.c_proj.bias']})
+    state_dict.update({'attention_layer.transformer.resblocks.1.ln_2.weight': state_dict['visual.transformer.resblocks.23.ln_2.weight']})
+    state_dict.update({'attention_layer.transformer.resblocks.1.ln_2.bias': state_dict['visual.transformer.resblocks.23.ln_2.bias']})
+
+
+
     vision_cfg = CLIPVisionCfg(
         layers=vision_layers,
         width=vision_width,
@@ -600,8 +779,6 @@ def build_model_from_openai_state_dict(
         heads=transformer_heads,
         layers=transformer_layers,
     )
-
-    # FIXME 修改
     mytransformer_cfg=MyTransformerCfg()
 
     model = CLIP(
@@ -610,12 +787,15 @@ def build_model_from_openai_state_dict(
         text_cfg=text_cfg,
         quick_gelu=quick_gelu,  # OpenAI models were trained with QuickGELU
         cast_dtype=cast_dtype,
-        mytransformer_cfg=mytransformer_cfg,
+        mytransformer_cfg=mytransformer_cfg,  # FIXME add mytransformer_cfg
     )
+
+    
 
     for key in ["input_resolution", "context_length", "vocab_size"]:
         state_dict.pop(key, None)
     convert_weights_to_fp16(model)  # OpenAI state dicts are partially converted to float16
+    # FIXME Add modify strict to false
     model.load_state_dict(state_dict, strict=False)
     return model.eval()
 

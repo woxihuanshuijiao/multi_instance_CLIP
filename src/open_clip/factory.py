@@ -200,12 +200,15 @@ def create_model(
 
     if pretrained and pretrained.lower() == 'openai':
         logging.info(f'Loading pretrained {model_name} from OpenAI.')
+
+        ##################### FIXME 加载模型权重 ##########################
         model = load_openai_model(
             model_name,
             precision=precision,
             device=device,
             cache_dir=cache_dir,
         )
+        
     else:
         model_cfg = model_cfg or get_model_config(model_name)
         if model_cfg is not None:

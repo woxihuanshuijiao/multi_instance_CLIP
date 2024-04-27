@@ -1,4 +1,5 @@
 import ast
+import copy
 import json
 import logging
 import math
@@ -8,6 +9,8 @@ import sys
 import braceexpand
 from dataclasses import dataclass
 from multiprocessing import Value
+
+### added
 from torchvision import transforms as tf
 import torchvision.transforms.functional as ttf
 
@@ -27,9 +30,6 @@ try:
 except ImportError:
     hvd = None
 
-from matplotlib import pyplot as plt
-from matplotlib import gridspec
-
 
 # FIXME 在封装前就将图片划分成子图
 # FIXME 裁剪函数
@@ -39,20 +39,100 @@ def crop_and_merge(images, subfig_size):
     h = height // subfig_size
     # FIXME 更新方法为view
     images = images.contiguous().view(3, height, w, width // w)
-    images = images.contiguous().view(3, h, height // h, w, width // w )
-    images = images.permute(1, 3, 0, 2, 4 )
-    images = images.contiguous().view(-1, 3, height // h, width // w )
-  
+    images = images.contiguous().view(3, h, height // h, w, width // w)
+    images = images.permute(1, 3, 0, 2, 4)
+    images = images.contiguous().view(-1, 3, height // h, width // w)
+
     return images
 
 
-# FIXME 缩放函数
-def zoom_(img, h, w, subsize):
-    weight, height = img.size
-    ratio = (h * w * (subsize**2)) / (weight * height)
-    if ratio < 0.7:
-        pane_size = (w*subsize, h*subsize)  
-        img.thumbnail(pane_size, Image.ANTIALIAS) 
+# FIXME 计算图片的尺寸
+def _setup_size(img, max_subfigs, min_subfigs=1, subfig_size=336):
+    resize_flag = 0
+    predefined_sizes = [(1, 9), (1, 8), (1, 7), (1, 6), (1, 5), (2, 3), (2, 4), (3, 3)]
+    # 200 * 2000   --> 1/9 --> 1 * 336 | 9 * 336
+    (w, h) = img.size
+
+    h_crop_num = max(h // subfig_size, min_subfigs)
+    w_crop_num = max(w // subfig_size, min_subfigs)
+
+    # 设置一个补全阈值，超过子图1/3像素会进行补全
+    thrs_ = subfig_size // 3
+    if h // subfig_size > 0 and h % subfig_size > thrs_: h_crop_num += 1
+    if w // subfig_size > 0 and w % subfig_size > thrs_: w_crop_num += 1
+
+    # 可以裁剪的子图数 > 规定的子图数
+    if h_crop_num * w_crop_num > max_subfigs:
+        resize_flag = 1
+        # 寻找最佳因子对
+        best_factors = None
+        min_diff = float('inf')
+
+        for pair in predefined_sizes:
+            diff = abs((pair[0] / pair[1]) - (w / h if h > w else h / w))
+            # 选择最近的
+            if diff < min_diff:
+                min_diff = diff
+                best_factors = pair
+
+        if h > w:  # 键值对的格式：（小因子，大因子）
+            w_crop_num, h_crop_num = best_factors
+        else:
+            h_crop_num, w_crop_num = best_factors
+
+    new_sizes = (h_crop_num * subfig_size, w_crop_num * subfig_size)
+
+    return new_sizes, h_crop_num, w_crop_num, resize_flag
+
+
+# FIXME 计算图片的尺寸_syx
+def _setup_size_all_resize(img, max_subfigs, min_subfigs=1, subfig_size=336):
+    # 如果超过了最大尺寸，resize_flag会被置为1
+    resize_flag = 0
+    predefined_sizes = [(1,5), (1,6), (1, 4), (1, 3), (1,2), (2, 3), (2, 2)]
+
+    ## simple try
+    # predefined_sizes = [(2, 2)]
+    # 200 * 2000   --> 1/9 --> 1 * 336 | 9 * 336
+    (w, h) = img.size
+
+    h_crop_num = max(h // subfig_size, min_subfigs)
+    w_crop_num = max(w // subfig_size, min_subfigs)
+
+    # 设置一个补全阈值，超过子图1/6像素会进行补全
+    thrs_ = subfig_size // 6
+    if h // subfig_size > 0 and h % subfig_size > thrs_: h_crop_num += 1
+    if w // subfig_size > 0 and w % subfig_size > thrs_: w_crop_num += 1
+
+    # 可以裁剪的子图数 > 规定的子图数
+    if h_crop_num * w_crop_num > max_subfigs:
+        resize_flag = 1
+        # 寻找最佳因子对
+        best_factors = None
+        min_diff = float('inf')
+
+        for pair in predefined_sizes:
+            diff = abs((pair[0] / pair[1]) - (w / h if h > w else h / w))
+            # 选择最近的
+            if diff <= min_diff:
+                min_diff = diff
+                best_factors = pair
+
+        if h > w:  # 键值对的格式：（小因子，大因子）
+            w_crop_num, h_crop_num = best_factors
+            ## 等比缩放 按照最大的边进行缩放
+            ratio = max(min_subfigs, int(round(w * h_crop_num / h)))
+            new_sizes = (h_crop_num * subfig_size, ratio * subfig_size)
+        else:
+            h_crop_num, w_crop_num = best_factors
+            ## 等比缩放 按照最大的边进行缩放
+            ratio = max(min_subfigs, int(round(h * w_crop_num / w)))
+            new_sizes = (ratio * subfig_size, w_crop_num * subfig_size)
+            # new_sizes = (h_crop_num * subfig_size, w_crop_num * subfig_size)
+    else:
+        new_sizes = (h_crop_num * subfig_size, w_crop_num * subfig_size)
+    return new_sizes, h_crop_num, w_crop_num, resize_flag
+
 
 
 # FIXME 随机翻转函数
@@ -62,93 +142,81 @@ def random_flip(img, p=0.5):
     random_p = random.random()
     if random_p > p:
         return img
-    elif random_p <= p/2:
-        img = img.transpose(Image.FLIP_LEFT_RIGHT) 
+    elif random_p <= p / 2:
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
     else:
-        img = img.transpose(Image.FLIP_TOP_BOTTOM) 
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
     return img
-      
-
-
-# FIXME 计算图片的尺寸
-def _setup_size(img, max_subfigs, min_subfigs=1, subfig_size=224):  
-
-    (w, h) = img.size  
-
-    h_crop_num = max(h // subfig_size, min_subfigs)  
-    w_crop_num = max(w // subfig_size, min_subfigs)  
-
-    # 设置一个补全阈值，超过子图一半像素会进行补全
-    thrs_ = subfig_size // 2
-    if h // subfig_size > 0 and h % subfig_size > thrs_: h_crop_num += 1  
-    if w // subfig_size > 0 and w % subfig_size > thrs_: w_crop_num += 1  
-    
-    # 可以裁剪的子图数 > 规定的子图数
-    if h_crop_num * w_crop_num > max_subfigs:
-        # 寻找最佳因子对  
-        best_factors = None  
-        min_diff = float('inf') 
-
-        for i in range(1, int(max_subfigs**0.5) + 1):  
-            if max_subfigs % i == 0:  
-                pair = (i, max_subfigs // i)  
-                # 计算子图裁剪方案 与因子对 的接近程度
-                diff = abs((pair[0] / pair[1]) - (w / h if h > w else h / w))  
-                # 选择最近的
-                if diff < min_diff:  
-                    min_diff = diff  
-                    best_factors = pair
-
-        if h > w:  # 键值对的格式：（小因子，大因子）
-            w_crop_num, h_crop_num = best_factors  
-        else:  
-            h_crop_num, w_crop_num = best_factors
-
-    new_sizes = (h_crop_num * subfig_size, w_crop_num * subfig_size)
-    
-    return new_sizes, h_crop_num, w_crop_num
-
-
-
 
 
 # FIXME 自动裁剪类
 class AutoCrop(torch.nn.Module):
-    def __init__(self, max_subfigs, min_subfigs=1, subfig_size=224, zoom_flag=False, p=0.5):
+    def __init__(self, max_subfigs, min_subfigs=1, subfig_size=224, p=0.5):
         super().__init__()
         self.max_subfigs = max_subfigs
         self.min_subfigs = min_subfigs
         self.subfig_size = subfig_size
         self.size = ()
-        self.zoom_flag = zoom_flag
         self.p = p
 
     def forward(self, img):
         # FIXME 随机旋转功能加到自动裁剪类里面了
         img = random_flip(img, self.p)
+        org_size = img.size
+        # self.size, h_crop_num, w_crop_num, resize_flag = _setup_size(img=img, max_subfigs=self.max_subfigs,
+        #                                                              subfig_size=self.subfig_size)
+        self.size, h_crop_num, w_crop_num, resize_flag = _setup_size_all_resize(img=img, max_subfigs=self.max_subfigs,
+                                                                     subfig_size=self.subfig_size)
+        
+        ## panel generation
+        if resize_flag == 1:
+            # 使用resize方法，而非等比缩放
+            # size格式（w，h）
+            # img.save(bname)
+            try:
+                img =  ttf.resize(img.convert('RGB'), self.size)
+                img_panel = np.zeros((h_crop_num * self.subfig_size, w_crop_num * self.subfig_size, 3), dtype=np.uint8)
+                img_panel[:img.size[1], :img.size[0], :] = np.array(img)
+            except:
+                print(f'org:{org_size}, resize:{self.size}, h_crop_num:{h_crop_num}, w_crop_num:{w_crop_num}')
+            img = Image.fromarray(img_panel)
+            # img.save(aname)
 
-        self.size, h_crop_num, w_crop_num= _setup_size(img=img, max_subfigs=self.max_subfigs, subfig_size=self.subfig_size)
-        if self.zoom_flag:
-            zoom_(img=img, h=h_crop_num, w=w_crop_num, subsize=self.subfig_size)
+            return img
+        
         return ttf.center_crop(img, self.size)
-    
 
 
 class CsvDataset(Dataset):
-    def __init__(self, input_filename, transforms, p, zoom_flag, subfig_size, max_subfigs, min_subfigs, img_key, caption_key, sep="\t", tokenizer=None):
+    def __init__(self, input_filename, transforms, img_key, caption_key, sep="\t", tokenizer=None):
         logging.debug(f'Loading csv data from {input_filename}.')
         df = pd.read_csv(input_filename, sep=sep)
 
-        self.images = df[img_key].tolist()[:2000]
-        self.captions = df[caption_key].tolist()[:2000]
-        
-        self.subfig_size = subfig_size
-        self.max_subfigs = max_subfigs
+        self.images = df[img_key].tolist()
+        self.captions = df[caption_key].tolist()
         self.transforms = transforms
-        # FIXME 已修改
-        transforms_list = list(self.transforms.transforms)
+
+        # self.transforms --> autocrop + totensor + normalize
+        # self.transforms_global --> resize + totensor + normalize
+
+        # transforms_global deep copy transforms
+        transforms_list_global = copy.deepcopy(list(self.transforms.transforms))
+        transforms_list_global[0] = tf.Resize((336, 336), interpolation=3)  # 3: bicubic
+        self.transforms_global = tf.Compose(transforms_list_global)
+        transforms_list = copy.deepcopy(list(self.transforms.transforms))
         # transforms_list[0] = tf.CenterCrop((448, 448))
-        transforms_list[0] =  AutoCrop(max_subfigs=max_subfigs, min_subfigs=min_subfigs, subfig_size=subfig_size, zoom_flag=zoom_flag, p=p)
+        self.max_subfigs = 6
+
+        ########## FIXME global images ##########
+        self.total_figs = self.max_subfigs + 1
+
+        self.subfig_size = 336
+        self.attention_max_tokens = 576
+        
+        self.token_len = self.attention_max_tokens // self.total_figs
+        self.p = 0.5
+        transforms_list[0] = AutoCrop(max_subfigs=self.max_subfigs, min_subfigs=1, subfig_size=self.subfig_size,
+                                      p=self.p)
         self.transforms = tf.Compose(transforms_list)
 
         logging.debug('Done loading data.')
@@ -159,45 +227,32 @@ class CsvDataset(Dataset):
         return len(self.captions)
 
     def __getitem__(self, idx):
-        images= self.transforms(Image.open(str(self.images[idx])))
+        images = self.transforms(Image.open(str(self.images[idx])))
+        images_global = self.transforms_global(Image.open(str(self.images[idx])))
+        texts = self.tokenize([str(self.captions[idx])])[0]
 
-        fig = plt.figure(figsize=(10, 8)) 
-        grid = gridspec.GridSpec(1, 2, figure=fig)
-        ax1 = fig.add_subplot(grid[0, 0])  
-        nested_grid1 = gridspec.GridSpecFromSubplotSpec(2, 1, subplot_spec=grid[0, 0])
-        for i in range(2):  
-            ax = fig.add_subplot(nested_grid1[i, 0])  
-            if i == 0:  
-                ax.imshow(Image.open(str(self.images[idx])))              
-            else:  
-                ax.imshow(np.clip(images.permute(1,2,0).detach().numpy().astype(np.float32),0,1))       
-        ax1.set_title(f'org(w,h)={Image.open(str(self.images[idx])).size}, resize(w,h)=({images.shape[2]} , {images.shape[1]})') 
-        
+        ## token mask, one image equal to 576 // 7 tokens
+        attention_mask = torch.zeros(self.attention_max_tokens + 1, dtype=torch.long)
         # 裁剪成子图
-        images = crop_and_merge(images=images,subfig_size=self.subfig_size)
-
+        images = crop_and_merge(images=images, subfig_size=self.subfig_size)
         # 不满足6张子图的进行0填充
         figs_num, _, _, _ = images.shape
         if figs_num < self.max_subfigs:
-            zero_tensor = torch.zeros(self.max_subfigs - figs_num, 3, self.subfig_size, self.subfig_size)  
-            images = torch.cat((images, zero_tensor), dim=0) 
+            zero_tensor = torch.zeros(self.max_subfigs - figs_num, 3, self.subfig_size, self.subfig_size)
+            images = torch.cat((images, zero_tensor), dim=0)
+        ## cat images and images_global
+
+        ######### FIXME global images ############
+        if self.total_figs > self.max_subfigs:
+            images = torch.cat((images_global.unsqueeze(0), images), dim=0)
+
+            # 1 represents that the image need to be masked
+            attention_mask[ (figs_num + 1) * self.token_len + 1 :] = 1
+        else:
+            attention_mask[ figs_num * self.token_len + 1 :] = 1
 
 
-        # FIXME 确保图像无误，画图查看
-        ax2 = fig.add_subplot(grid[0, 1])
-        iidx = 0
-        nested_grid = gridspec.GridSpecFromSubplotSpec(2, 3, subplot_spec=grid[0, 1])  
-        for i in range(2):  
-            for j in range(3):  
-                nested_ax = fig.add_subplot(nested_grid[i, j])  
-                nested_ax.imshow(np.clip(images[iidx,:,:,:].permute(1,2,0).detach().numpy().astype(np.float32),0,1))  
-                iidx+=1        
-        sub_figno = np.random.randint(0, 1000)
-        sub_figname = "fig" + str(sub_figno) + '.png'
-        plt.savefig(os.path.join('/home/wangyuhan/clip/open_clip/remd_fig', sub_figname))
-
-        texts = self.tokenize([str(self.captions[idx])])[0]
-        return images, texts
+        return images, texts, attention_mask
 
 
 class SharedEpoch:
@@ -231,7 +286,7 @@ def expand_urls(urls, weights=None):
     if isinstance(urls, str):
         urllist = urls.split("::")
         weights = weights.split('::')
-        assert len(weights) == len(urllist),\
+        assert len(weights) == len(urllist), \
             f"Expected the number of data components ({len(urllist)}) and weights({len(weights)}) to match."
         weights = [float(weight) for weight in weights]
         all_urls, all_weights = [], []
@@ -428,13 +483,13 @@ class ResampledShards2(IterableDataset):
     """An iterable dataset yielding a list of urls."""
 
     def __init__(
-        self,
-        urls,
-        weights=None,
-        nshards=sys.maxsize,
-        worker_seed=None,
-        deterministic=False,
-        epoch=-1,
+            self,
+            urls,
+            weights=None,
+            nshards=sys.maxsize,
+            worker_seed=None,
+            deterministic=False,
+            epoch=-1,
     ):
         """Sample shards from the shard list with replacement.
 
@@ -445,7 +500,7 @@ class ResampledShards2(IterableDataset):
         self.urls = urls
         self.weights = weights
         if self.weights is not None:
-            assert len(self.urls) == len(self.weights),\
+            assert len(self.urls) == len(self.weights), \
                 f"Number of urls {len(self.urls)} and weights {len(self.weights)} should match."
         assert isinstance(self.urls[0], str)
         self.nshards = nshards
@@ -495,13 +550,13 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
                     'Please specify it via `--train-num-samples` if no dataset length info is present.')
     else:
         # Eval will just exhaust the iterator if the size is not specified.
-        num_samples = args.val_num_samples or 0 
+        num_samples = args.val_num_samples or 0
 
     shared_epoch = SharedEpoch(epoch=epoch)  # create a shared epoch store to sync epoch to dataloader worker proc
 
     if is_train and args.train_data_upsampling_factors is not None:
         assert resampled, "--train_data_upsampling_factors is only supported when sampling with replacement (with --dataset-resampled)."
-    
+
     if resampled:
         pipeline = [ResampledShards2(
             input_shards,
@@ -596,28 +651,12 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
     return DataInfo(dataloader=dataloader, shared_epoch=shared_epoch)
 
 
-
-
-
-    
-
-
-
-
-
-
 def get_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
     input_filename = args.train_data if is_train else args.val_data
     assert input_filename
     dataset = CsvDataset(
         input_filename,
         preprocess_fn,
-        # FIXME 新增参数
-        p = args.p,
-        zoom_flag=args.zoom_flag,
-        subfig_size=args.subfig_size,
-        max_subfigs=args.max_subfigs,
-        min_subfigs=args.min_subfigs,
         img_key=args.csv_img_key,
         caption_key=args.csv_caption_key,
         sep=args.csv_separator,
@@ -640,7 +679,6 @@ def get_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
     dataloader.num_batches = len(dataloader)
 
     return DataInfo(dataloader, sampler)
-    
 
 
 class SyntheticDataset(Dataset):
@@ -711,7 +749,7 @@ def get_dataset_fn(data_path, dataset_type):
                 f"Tried to figure out dataset type, but failed for extension {ext}.")
     else:
         raise ValueError(f"Unsupported dataset type: {dataset_type}")
-    
+
 
 def get_data(args, preprocess_fns, epoch=0, tokenizer=None):
     preprocess_train, preprocess_val = preprocess_fns
